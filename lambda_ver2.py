@@ -186,18 +186,20 @@ def lambda_handler(event, context):
 קטגוריות אפשריות:
 1. clause_drafting - בקשה לניסוח סעיף חדש, כתיבת סעיף, יצירת נוסח
    דוגמאות: "נסח סעיף...", "כתוב סעיף...", "צור נוסח ל...", "איך לנסח..."
-   
+
 2. compliance_check - בדיקת התאמה, השוואה בין מסמכים, בדיקת עמידה בדרישות
    דוגמאות: "בדוק התאמה...", "השווה בין...", "האם עומד בדרישות...", "מה הפערים..."
-   
+
 3. document_analysis - ניתוח מסמך, תקציר, זיהוי סיכונים, סקירת חוזה
    דוגמאות: "נתח את המסמך...", "תן תקציר...", "מה הסיכונים...", "סקור את החוזה..."
-   
+
 4. general - שאלות כלליות, הבהרות, מידע על תהליכים
    דוגמאות: "מה זה...", "הסבר לי...", "איך עובד...", "מה ההבדל..."
 
-השאילתה:
+השאילתה הנוכחית:
 {query}
+
+אם יש שאילתות קודמות, קח אותן בחשבון להבנת ההקשר.
 
 ענה רק עם אחת מהמילים: clause_drafting, compliance_check, document_analysis, general
 אל תוסיף שום הסבר או טקסט נוסף.
@@ -241,12 +243,37 @@ def lambda_handler(event, context):
     def get_document_from_s3(document_key):
         """Retrieve document content from S3 and extract text"""
         try:
-            response = s3_client.get_object(Bucket=S3_BUCKET, Key=document_key)
-            file_content = response['Body'].read()
-            
             # Determine file type from extension
             file_extension = document_key.lower().split('.')[-1]
-            
+
+            # For DOCX files, first try to get pre-processed .txt version
+            if file_extension in ['docx', 'doc']:
+                txt_key = document_key.rsplit('.', 1)[0] + '.txt'
+                try:
+                    logger.info(f"Checking for pre-processed text file: {txt_key}")
+                    txt_response = s3_client.get_object(Bucket=S3_BUCKET, Key=txt_key)
+                    txt_content = txt_response['Body'].read()
+
+                    # Try to decode with various encodings
+                    for encoding in ['utf-8', 'windows-1255', 'iso-8859-8', 'latin-1', 'cp862']:
+                        try:
+                            decoded_text = txt_content.decode(encoding)
+                            logger.info(f"Successfully loaded pre-processed text file: {txt_key}")
+                            return decoded_text
+                        except UnicodeDecodeError:
+                            continue
+                    logger.warning(f"Could not decode pre-processed text file: {txt_key}")
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'NoSuchKey':
+                        logger.info(f"No pre-processed text file found for {document_key}, will extract from DOCX")
+                    else:
+                        logger.warning(f"Error accessing pre-processed text file: {e}")
+
+            # If we get here, either it's not a DOCX or the .txt file wasn't found
+            # Proceed with normal extraction
+            response = s3_client.get_object(Bucket=S3_BUCKET, Key=document_key)
+            file_content = response['Body'].read()
+
             if file_extension == 'pdf':
                 # Extract text from PDF using PyPDF2
                 try:
@@ -263,7 +290,9 @@ def lambda_handler(event, context):
                     return None
                     
             elif file_extension in ['docx', 'doc']:
-                # Extract text from DOCX using pure Python (no lxml dependency)
+                # FALLBACK: Extract text from DOCX using manual XML parsing
+                # NOTE: This is a fallback method. For best results, upload a pre-processed
+                # .txt file alongside the .docx file (e.g., "document.txt" for "document.docx")
                 try:
                     import zipfile
                     import io
@@ -313,11 +342,23 @@ def lambda_handler(event, context):
             logger.error(f"Error retrieving document from S3: {e}")
             return None
 
-    def classify_query(query):
+    def classify_query(query, prev_turns=None):
         """Classify user query to determine the appropriate mode"""
         try:
-            classification_msg = classification_prompt.format(query=query)
-            
+            # Build context from previous user queries (last 4)
+            context_queries = ""
+            if prev_turns:
+                recent_user_queries = []
+                for turn in prev_turns[-4:]:  # Last 4 turns
+                    user_msg = turn.get("user_message", "").strip()
+                    if user_msg:
+                        recent_user_queries.append(user_msg)
+
+                if recent_user_queries:
+                    context_queries = "\n\nשאילתות קודמות בשיחה:\n" + "\n".join([f"{i+1}. {q}" for i, q in enumerate(recent_user_queries)])
+
+            classification_msg = classification_prompt.format(query=query) + context_queries
+
             messages = [{"role": 'user', "content": classification_msg}]
             invoke_json = json.dumps({
                 "anthropic_version": anthropic_version,
@@ -325,26 +366,26 @@ def lambda_handler(event, context):
                 "messages": messages,
                 "temperature": 0.0  # Low temperature for consistent classification
             })
-            
+
             response = bedrock_client.invoke_model(
                 body=invoke_json,
                 modelId=modelId,
                 accept=accept,
                 contentType=contentType
             )
-            
+
             response_body = json.loads(response.get('body').read())
             detected_mode = response_body.get('content')[0]['text'].strip().lower()
-            
+
             # Validate mode
             valid_modes = ['clause_drafting', 'compliance_check', 'document_analysis', 'general']
             if detected_mode not in valid_modes:
                 logger.warning(f"Invalid mode detected: {detected_mode}, defaulting to general")
                 return 'general'
-            
+
             logger.info(f"Classified query as mode: {detected_mode}")
             return detected_mode
-            
+
         except Exception as e:
             logger.error(f"Error classifying query: {e}")
             return 'general'  # Default to general mode on error
@@ -436,10 +477,20 @@ def lambda_handler(event, context):
                 'body': json.dumps({'error_message': 'query is required'})
             }
 
+        # Load previous conversation turns first (needed for classification)
+        prev_turns = None
+        if session_id:
+            resp = chat_table.query(
+                KeyConditionExpression=Key('session_id').eq(session_id),
+                ScanIndexForward=False,
+                Limit=N_LAST_TURNS
+            )
+            prev_turns = list(reversed(resp.get('Items', [])))
+
         # Auto-detect mode if not provided
         if not mode:
             logger.info("Mode not provided, classifying query...")
-            mode = classify_query(query)
+            mode = classify_query(query, prev_turns)
         else:
             logger.info(f"Mode explicitly provided: {mode}")
 
@@ -454,17 +505,8 @@ def lambda_handler(event, context):
             logger.warning("Classified as document_analysis but no document provided, switching to general mode")
             mode = "general"
 
-        # Load previous conversation turns
-        prev_turns = None
-        is_first_turn = False
-        if session_id:
-            resp = chat_table.query(
-                KeyConditionExpression=Key('session_id').eq(session_id),
-                ScanIndexForward=False,
-                Limit=N_LAST_TURNS
-            )
-            prev_turns = list(reversed(resp.get('Items', [])))
-            is_first_turn = (prev_turns is None) or (len(prev_turns) == 0)
+        # Check if this is the first turn
+        is_first_turn = (prev_turns is None) or (len(prev_turns) == 0)
 
         # Select prompt based on mode
         mode_prompts = {
