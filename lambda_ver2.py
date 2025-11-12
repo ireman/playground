@@ -562,11 +562,15 @@ def lambda_handler(event, context):
             )
 
         # Retrieve relevant contexts from knowledge base
+        # Default data source filter for all modes
+        DEFAULT_DATA_SOURCE_ID = 'GCPM11ODT7'
+
         # For document_analysis mode, filter by specific document URI if available
+        # source_uri takes precedence over data_source_id in the retrieve() function
         if mode == "document_analysis" and kb_source_uri:
-            response_kb = retrieve(query, kbId, numberOfResults, source_uri=kb_source_uri)
+            response_kb = retrieve(query, kbId, numberOfResults, data_source_id=DEFAULT_DATA_SOURCE_ID, source_uri=kb_source_uri)
         else:
-            response_kb = retrieve(query, kbId, numberOfResults)
+            response_kb = retrieve(query, kbId, numberOfResults, data_source_id=DEFAULT_DATA_SOURCE_ID)
         contexts, sources = get_contexts(response_kb['retrievalResults'])
 
         # Load documents from S3 if needed
