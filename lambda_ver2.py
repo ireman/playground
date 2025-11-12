@@ -207,17 +207,22 @@ def lambda_handler(event, context):
 '''
 
     def get_tender_info(tender_number):
-        """Lookup tender information from tender_list table"""
+        """Lookup tender information from tender_list table by scanning"""
         try:
-            response = tender_list_table.get_item(Key={'tender_number': tender_number})
-            if 'Item' in response:
+            # Scan the table with a filter to find matching tender_number
+            response = tender_list_table.scan(
+                FilterExpression=Key('tender_number').eq(tender_number)
+            )
+
+            if response.get('Items') and len(response['Items']) > 0:
+                tender_item = response['Items'][0]  # Get first matching item
                 logger.info(f"Found tender info for tender_number: {tender_number}")
-                return response['Item']
+                return tender_item
             else:
                 logger.warning(f"No tender found for tender_number: {tender_number}")
                 return None
         except Exception as e:
-            logger.error(f"Error looking up tender_number {tender_number}: {e}")
+            logger.error(f"Error scanning for tender_number {tender_number}: {e}")
             return None
 
     def retrieve(query, kbId, numberOfResults, data_source_id=None, source_uri=None):
@@ -501,8 +506,8 @@ def lambda_handler(event, context):
         if tender_number:
             tender_info = get_tender_info(tender_number)
             if tender_info:
-                kb_source_uri = tender_info.get('kb_source_uri')
-                logger.info(f"Retrieved kb_source_uri: {kb_source_uri} for tender_number: {tender_number}")
+                kb_source_uri = tender_info.get('uri')
+                logger.info(f"Retrieved uri: {kb_source_uri} for tender_number: {tender_number}")
             else:
                 logger.warning(f"Could not find tender info for tender_number: {tender_number}")
 
