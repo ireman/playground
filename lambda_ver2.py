@@ -22,6 +22,7 @@ N_LAST_TURNS = int(os.environ.get("N_LAST_TURNS", 6))
 dynamodb = boto3.resource('dynamodb')
 chat_table = dynamodb.Table(DYNAMODB_TABLE)
 sessions_table = dynamodb.Table('session_info')
+tender_list_table = dynamodb.Table('tender_list')
 
 client = boto3.client(service_name='secretsmanager', region_name=region_id)
 bedrock_config = Config(connect_timeout=120, read_timeout=120, retries={'max_attempts': 0})
@@ -205,22 +206,46 @@ def lambda_handler(event, context):
 אל תוסיף שום הסבר או טקסט נוסף.
 '''
 
-    def retrieve(query, kbId, numberOfResults, data_source_id=None):
+    def get_tender_info(tender_number):
+        """Lookup tender information from tender_list table"""
+        try:
+            response = tender_list_table.get_item(Key={'tender_number': tender_number})
+            if 'Item' in response:
+                logger.info(f"Found tender info for tender_number: {tender_number}")
+                return response['Item']
+            else:
+                logger.warning(f"No tender found for tender_number: {tender_number}")
+                return None
+        except Exception as e:
+            logger.error(f"Error looking up tender_number {tender_number}: {e}")
+            return None
+
+    def retrieve(query, kbId, numberOfResults, data_source_id=None, source_uri=None):
         retrieval_config = {
             'vectorSearchConfiguration': {
                 'numberOfResults': numberOfResults,
                 'overrideSearchType': "HYBRID"
             }
         }
-        
-        if data_source_id:
+
+        # Filter by specific document URI (takes precedence over data_source_id)
+        if source_uri:
+            retrieval_config['vectorSearchConfiguration']['filter'] = {
+                'equals': {
+                    'key': 'x-amz-bedrock-kb-source-uri',
+                    'value': source_uri
+                }
+            }
+            logger.info(f"Filtering KB retrieval by source URI: {source_uri}")
+        elif data_source_id:
             retrieval_config['vectorSearchConfiguration']['filter'] = {
                 'equals': {
                     'key': 'x-amz-bedrock-kb-data-source-id',
                     'value': data_source_id
                 }
             }
-        
+            logger.info(f"Filtering KB retrieval by data source ID: {data_source_id}")
+
         return bedrock_agent_client.retrieve(
             retrievalQuery={'text': query},
             knowledgeBaseId=kbId,
@@ -469,6 +494,17 @@ def lambda_handler(event, context):
         tender_doc_key = 'joint-tender.pdf' #body.get('tender_document')
         vendor_proposal_key = 'proposal-surpass.docx' #body.get('vendor_proposal')
         uploaded_doc_key = body.get('uploaded_document')
+        tender_number = body.get('tender_number')
+
+        # Lookup tender info if tender_number provided
+        kb_source_uri = None
+        if tender_number:
+            tender_info = get_tender_info(tender_number)
+            if tender_info:
+                kb_source_uri = tender_info.get('kb_source_uri')
+                logger.info(f"Retrieved kb_source_uri: {kb_source_uri} for tender_number: {tender_number}")
+            else:
+                logger.warning(f"Could not find tender info for tender_number: {tender_number}")
 
         if not query:
             return {
@@ -526,7 +562,11 @@ def lambda_handler(event, context):
             )
 
         # Retrieve relevant contexts from knowledge base
-        response_kb = retrieve(query, kbId, numberOfResults)
+        # For document_analysis mode, filter by specific document URI if available
+        if mode == "document_analysis" and kb_source_uri:
+            response_kb = retrieve(query, kbId, numberOfResults, source_uri=kb_source_uri)
+        else:
+            response_kb = retrieve(query, kbId, numberOfResults)
         contexts, sources = get_contexts(response_kb['retrievalResults'])
 
         # Load documents from S3 if needed
